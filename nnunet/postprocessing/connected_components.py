@@ -321,7 +321,7 @@ def determine_postprocessing(base, gt_labels_folder, raw_subfolder_name="validat
             output_file = join(folder_per_class, f)
             results.append(p.starmap_async(load_remove_save, ((predicted_segmentation, output_file, classes, min_size_kept),)))
             if f_dict: # zhuc
-                gt_name = f_dict[f.split('.'[0])]['properties']['seg_file'].split(os.sep)[-1]
+                gt_name = f_dict[f.split('.')[0]]['properties']['seg_file'].split(os.sep)[-1]
             else:
                 gt_name = f
             pred_gt_tuples.append([output_file, join(gt_labels_folder, gt_name)])
