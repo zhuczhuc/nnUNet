@@ -1,4 +1,4 @@
-#    Copyright 2019 Division of Medical Image Computing, German Cancer Research Center (DKFZ), Heidelberg, Germany
+#    Copyright 2020 Division of Medical Image Computing, German Cancer Research Center (DKFZ), Heidelberg, Germany
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -12,124 +12,332 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+
 import torch
-from nnunet.utilities.nd_softmax import softmax_helper
 from nnunet.training.loss_functions.ND_Crossentropy import CrossentropyND
+from nnunet.training.loss_functions.TopK_loss import TopKLoss
+from nnunet.utilities.nd_softmax import softmax_helper
 from nnunet.utilities.tensor_utilities import sum_tensor
 from torch import nn
+import numpy as np
 
 
-class SoftDiceLoss(nn.Module):
-    def __init__(self, smooth=1., apply_nonlin=None, batch_dice=False, do_bg=True, smooth_in_nom=True,
-                 background_weight=1, rebalance_weights=None, square_nominator=False, square_denom=False):
+class GDL(nn.Module):
+    def __init__(self, apply_nonlin=None, batch_dice=False, do_bg=True, smooth=1.,
+                 square=False, square_volumes=False):
         """
-        hahaa no documentation for you today
-        :param smooth:
-        :param apply_nonlin:
-        :param batch_dice:
-        :param do_bg:
-        :param smooth_in_nom:
-        :param background_weight:
-        :param rebalance_weights:
+        square_volumes will square the weight term. The paper recommends square_volumes=True; I don't (just an intuition)
         """
-        super(SoftDiceLoss, self).__init__()
-        self.square_denom = square_denom
-        self.square_nominator = square_nominator
-        if not do_bg:
-            assert background_weight == 1, "if there is no bg, then set background weight to 1 you dummy"
-        self.rebalance_weights = rebalance_weights
-        self.background_weight = background_weight
-        if smooth_in_nom:
-            self.smooth_in_nom = smooth
-        else:
-            self.smooth_in_nom = 0
+        super(GDL, self).__init__()
+
+        self.square_volumes = square_volumes
+        self.square = square
         self.do_bg = do_bg
         self.batch_dice = batch_dice
         self.apply_nonlin = apply_nonlin
         self.smooth = smooth
-        self.y_onehot = None
 
-    def forward(self, x, y):
-        with torch.no_grad():
-            y = y.long()
+    def forward(self, x, y, loss_mask=None):
         shp_x = x.shape
         shp_y = y.shape
-        if self.apply_nonlin is not None:
-            x = self.apply_nonlin(x)
+
+        if self.batch_dice:
+            axes = [0] + list(range(2, len(shp_x)))
+        else:
+            axes = list(range(2, len(shp_x)))
+
         if len(shp_x) != len(shp_y):
             y = y.view((shp_y[0], 1, *shp_y[1:]))
-        # now x and y should have shape (B, C, X, Y(, Z))) and (B, 1, X, Y(, Z))), respectively
-        y_onehot = torch.zeros(shp_x)
-        if x.device.type == "cuda":
-            y_onehot = y_onehot.cuda(x.device.index)
-        y_onehot.scatter_(1, y, 1)
+
+        if all([i == j for i, j in zip(x.shape, y.shape)]):
+            # if this is the case then gt is probably already a one hot encoding
+            y_onehot = y
+        else:
+            gt = y.long()
+            y_onehot = torch.zeros(shp_x)
+            if x.device.type == "cuda":
+                y_onehot = y_onehot.cuda(x.device.index)
+            y_onehot.scatter_(1, gt, 1)
+
+        if self.apply_nonlin is not None:
+            x = self.apply_nonlin(x)
+
         if not self.do_bg:
             x = x[:, 1:]
             y_onehot = y_onehot[:, 1:]
-        if not self.batch_dice:
-            if self.background_weight != 1 or (self.rebalance_weights is not None):
-                raise NotImplementedError("nah son")
-            l = soft_dice(x, y_onehot, self.smooth, self.smooth_in_nom, self.square_nominator, self.square_denom)
+
+        tp, fp, fn, _ = get_tp_fp_fn_tn(x, y_onehot, axes, loss_mask, self.square)
+
+        # GDL weight computation, we use 1/V
+        volumes = sum_tensor(y_onehot, axes) + 1e-6 # add some eps to prevent div by zero
+
+        if self.square_volumes:
+            volumes = volumes ** 2
+
+        # apply weights
+        tp = tp / volumes
+        fp = fp / volumes
+        fn = fn / volumes
+
+        # sum over classes
+        if self.batch_dice:
+            axis = 0
         else:
-            l = soft_dice_per_batch_2(x, y_onehot, self.smooth, self.smooth_in_nom,
-                                      background_weight=self.background_weight,
-                                      rebalance_weights=self.rebalance_weights)
-        return l
+            axis = 1
+
+        tp = tp.sum(axis, keepdim=False)
+        fp = fp.sum(axis, keepdim=False)
+        fn = fn.sum(axis, keepdim=False)
+
+        # compute dice
+        dc = (2 * tp + self.smooth) / (2 * tp + fp + fn + self.smooth)
+
+        dc = dc.mean()
+
+        return -dc
 
 
-def soft_dice_per_batch_2(net_output, gt, smooth=1., smooth_in_nom=1., background_weight=1, rebalance_weights=None,
-                        square_nominator=False, square_denom=False):
-    if rebalance_weights is not None and len(rebalance_weights) != gt.shape[1]:
-        rebalance_weights = rebalance_weights[1:] # this is the case when use_bg=False
-    axes = tuple([0] + list(range(2, len(net_output.size()))))
-    tp = sum_tensor(net_output * gt, axes, keepdim=False)
-    fn = sum_tensor((1 - net_output) * gt, axes, keepdim=False)
-    fp = sum_tensor(net_output * (1 - gt), axes, keepdim=False)
-    weights = torch.ones(tp.shape)
-    weights[0] = background_weight
-    if net_output.device.type == "cuda":
-        weights = weights.cuda(net_output.device.index)
-    if rebalance_weights is not None:
-        rebalance_weights = torch.from_numpy(rebalance_weights).float()
-        if net_output.device.type == "cuda":
-            rebalance_weights = rebalance_weights.cuda(net_output.device.index)
-        tp = tp * rebalance_weights
-        fn = fn * rebalance_weights
+def get_tp_fp_fn_tn(net_output, gt, axes=None, mask=None, square=False):
+    """
+    net_output must be (b, c, x, y(, z)))
+    gt must be a label map (shape (b, 1, x, y(, z)) OR shape (b, x, y(, z))) or one hot encoding (b, c, x, y(, z))
+    if mask is provided it must have shape (b, 1, x, y(, z)))
+    :param net_output:
+    :param gt:
+    :param axes: can be (, ) = no summation
+    :param mask: mask must be 1 for valid pixels and 0 for invalid pixels
+    :param square: if True then fp, tp and fn will be squared before summation
+    :return:
+    """
+    if axes is None:
+        axes = tuple(range(2, len(net_output.size())))
 
-    nominator = tp
+    shp_x = net_output.shape
+    shp_y = gt.shape
 
-    if square_nominator:
-        nominator = nominator ** 2
+    with torch.no_grad():
+        if len(shp_x) != len(shp_y):
+            gt = gt.view((shp_y[0], 1, *shp_y[1:]))
 
-    if square_denom:
-        denom = 2 * tp ** 2 + fp ** 2 + fn ** 2
-    else:
-        denom = 2 * tp + fp + fn
+        if all([i == j for i, j in zip(net_output.shape, gt.shape)]):
+            # if this is the case then gt is probably already a one hot encoding
+            y_onehot = gt
+        else:
+            gt = gt.long()
+            y_onehot = torch.zeros(shp_x)
+            if net_output.device.type == "cuda":
+                y_onehot = y_onehot.cuda(net_output.device.index)
+            y_onehot.scatter_(1, gt, 1)
 
-    result = (- ((2 * nominator + smooth_in_nom) / (denom + smooth)) * weights).mean()
-    return result
+    tp = net_output * y_onehot
+    fp = net_output * (1 - y_onehot)
+    fn = (1 - net_output) * y_onehot
+    tn = (1 - net_output) * (1 - y_onehot)
+
+    if mask is not None:
+        tp = torch.stack(tuple(x_i * mask[:, 0] for x_i in torch.unbind(tp, dim=1)), dim=1)
+        fp = torch.stack(tuple(x_i * mask[:, 0] for x_i in torch.unbind(fp, dim=1)), dim=1)
+        fn = torch.stack(tuple(x_i * mask[:, 0] for x_i in torch.unbind(fn, dim=1)), dim=1)
+        tn = torch.stack(tuple(x_i * mask[:, 0] for x_i in torch.unbind(tn, dim=1)), dim=1)
+
+    if square:
+        tp = tp ** 2
+        fp = fp ** 2
+        fn = fn ** 2
+        tn = tn ** 2
+
+    if len(axes) > 0:
+        tp = sum_tensor(tp, axes, keepdim=False)
+        fp = sum_tensor(fp, axes, keepdim=False)
+        fn = sum_tensor(fn, axes, keepdim=False)
+        tn = sum_tensor(tn, axes, keepdim=False)
+
+    return tp, fp, fn, tn
 
 
-def soft_dice(net_output, gt, smooth=1., smooth_in_nom=1., square_nominator=False, square_denom=False):
-    axes = tuple(range(2, len(net_output.size())))
-    if square_nominator:
-        intersect = sum_tensor(net_output * gt, axes, keepdim=False)
-    else:
-        intersect = sum_tensor((net_output * gt) ** 2, axes, keepdim=False)
-    if square_denom:
-        denom = sum_tensor(net_output ** 2 + gt ** 2, axes, keepdim=False)
-    else:
-        denom = sum_tensor(net_output + gt, axes, keepdim=False)
-    result = (- ((2 * intersect + smooth_in_nom) / (denom + smooth))).mean()
-    return result
+class SoftDiceLoss(nn.Module):
+    def __init__(self, apply_nonlin=None, batch_dice=False, do_bg=True, smooth=1.):
+        """
+        """
+        super(SoftDiceLoss, self).__init__()
+
+        self.do_bg = do_bg
+        self.batch_dice = batch_dice
+        self.apply_nonlin = apply_nonlin
+        self.smooth = smooth
+
+    def forward(self, x, y, loss_mask=None):
+        shp_x = x.shape
+
+        if self.batch_dice:
+            axes = [0] + list(range(2, len(shp_x)))
+        else:
+            axes = list(range(2, len(shp_x)))
+
+        if self.apply_nonlin is not None:
+            x = self.apply_nonlin(x)
+
+        tp, fp, fn, _ = get_tp_fp_fn_tn(x, y, axes, loss_mask, False)
+
+        nominator = 2 * tp + self.smooth
+        denominator = 2 * tp + fp + fn + self.smooth
+
+        dc = nominator / denominator
+
+        if not self.do_bg:
+            if self.batch_dice:
+                dc = dc[1:]
+            else:
+                dc = dc[:, 1:]
+        dc = dc.mean()
+
+        return -dc
+
+
+class MCCLoss(nn.Module):
+    def __init__(self, apply_nonlin=None, batch_mcc=False, do_bg=True, smooth=0.0):
+        """
+        based on matthews correlation coefficient
+        https://en.wikipedia.org/wiki/Matthews_correlation_coefficient
+
+        Does not work. Really unstable. F this.
+        """
+        super(MCCLoss, self).__init__()
+
+        self.smooth = smooth
+        self.do_bg = do_bg
+        self.batch_mcc = batch_mcc
+        self.apply_nonlin = apply_nonlin
+
+    def forward(self, x, y, loss_mask=None):
+        shp_x = x.shape
+        voxels = np.prod(shp_x[2:])
+
+        if self.batch_mcc:
+            axes = [0] + list(range(2, len(shp_x)))
+        else:
+            axes = list(range(2, len(shp_x)))
+
+        if self.apply_nonlin is not None:
+            x = self.apply_nonlin(x)
+
+        tp, fp, fn, tn = get_tp_fp_fn_tn(x, y, axes, loss_mask, False)
+        tp /= voxels
+        fp /= voxels
+        fn /= voxels
+        tn /= voxels
+
+        nominator = tp * tn - fp * fn + self.smooth
+        denominator = ((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)) ** 0.5 + self.smooth
+
+        mcc = nominator / denominator
+
+        if not self.do_bg:
+            if self.batch_mcc:
+                mcc = mcc[1:]
+            else:
+                mcc = mcc[:, 1:]
+        mcc = mcc.mean()
+
+        return -mcc
+
+
+class SoftDiceLossSquared(nn.Module):
+    def __init__(self, apply_nonlin=None, batch_dice=False, do_bg=True, smooth=1.):
+        """
+        squares the terms in the denominator as proposed by Milletari et al.
+        """
+        super(SoftDiceLossSquared, self).__init__()
+
+        self.do_bg = do_bg
+        self.batch_dice = batch_dice
+        self.apply_nonlin = apply_nonlin
+        self.smooth = smooth
+
+    def forward(self, x, y, loss_mask=None):
+        shp_x = x.shape
+        shp_y = y.shape
+
+        if self.batch_dice:
+            axes = [0] + list(range(2, len(shp_x)))
+        else:
+            axes = list(range(2, len(shp_x)))
+
+        if self.apply_nonlin is not None:
+            x = self.apply_nonlin(x)
+
+        with torch.no_grad():
+            if len(shp_x) != len(shp_y):
+                y = y.view((shp_y[0], 1, *shp_y[1:]))
+
+            if all([i == j for i, j in zip(x.shape, y.shape)]):
+                # if this is the case then gt is probably already a one hot encoding
+                y_onehot = y
+            else:
+                y = y.long()
+                y_onehot = torch.zeros(shp_x)
+                if x.device.type == "cuda":
+                    y_onehot = y_onehot.cuda(x.device.index)
+                y_onehot.scatter_(1, y, 1).float()
+
+        intersect = x * y_onehot
+        # values in the denominator get smoothed
+        denominator = x ** 2 + y_onehot ** 2
+
+        # aggregation was previously done in get_tp_fp_fn, but needs to be done here now (needs to be done after
+        # squaring)
+        intersect = sum_tensor(intersect, axes, False) + self.smooth
+        denominator = sum_tensor(denominator, axes, False) + self.smooth
+
+        dc = 2 * intersect / denominator
+
+        if not self.do_bg:
+            if self.batch_dice:
+                dc = dc[1:]
+            else:
+                dc = dc[:, 1:]
+        dc = dc.mean()
+
+        return -dc
 
 
 class DC_and_CE_loss(nn.Module):
-    def __init__(self, soft_dice_kwargs, ce_kwargs, aggregate="sum"):
+    def __init__(self, soft_dice_kwargs, ce_kwargs, aggregate="sum", square_dice=False, weight_ce=1, weight_dice=1):
+        """
+        CAREFUL. Weights for CE and Dice do not need to sum to one. You can set whatever you want.
+        :param soft_dice_kwargs:
+        :param ce_kwargs:
+        :param aggregate:
+        :param square_dice:
+        :param weight_ce:
+        :param weight_dice:
+        """
         super(DC_and_CE_loss, self).__init__()
+        self.weight_dice = weight_dice
+        self.weight_ce = weight_ce
         self.aggregate = aggregate
         self.ce = CrossentropyND(**ce_kwargs)
-        self.dc = SoftDiceLoss(apply_nonlin=softmax_helper, **soft_dice_kwargs)
+        if not square_dice:
+            self.dc = SoftDiceLoss(apply_nonlin=softmax_helper, **soft_dice_kwargs)
+        else:
+            self.dc = SoftDiceLossSquared(apply_nonlin=softmax_helper, **soft_dice_kwargs)
+
+    def forward(self, net_output, target):
+        dc_loss = self.dc(net_output, target) if self.weight_dice != 0 else 0
+        ce_loss = self.ce(net_output, target) if self.weight_ce != 0 else 0
+        if self.aggregate == "sum":
+            result = self.weight_ce * ce_loss + self.weight_dice * dc_loss
+        else:
+            raise NotImplementedError("nah son") # reserved for other stuff (later)
+        return result
+
+
+class GDL_and_CE_loss(nn.Module):
+    def __init__(self, gdl_dice_kwargs, ce_kwargs, aggregate="sum"):
+        super(GDL_and_CE_loss, self).__init__()
+        self.aggregate = aggregate
+        self.ce = CrossentropyND(**ce_kwargs)
+        self.dc = GDL(softmax_helper, **gdl_dice_kwargs)
 
     def forward(self, net_output, target):
         dc_loss = self.dc(net_output, target)
@@ -138,4 +346,24 @@ class DC_and_CE_loss(nn.Module):
             result = ce_loss + dc_loss
         else:
             raise NotImplementedError("nah son") # reserved for other stuff (later)
+        return result
+
+
+class DC_and_topk_loss(nn.Module):
+    def __init__(self, soft_dice_kwargs, ce_kwargs, aggregate="sum", square_dice=False):
+        super(DC_and_topk_loss, self).__init__()
+        self.aggregate = aggregate
+        self.ce = TopKLoss(**ce_kwargs)
+        if not square_dice:
+            self.dc = SoftDiceLoss(apply_nonlin=softmax_helper, **soft_dice_kwargs)
+        else:
+            self.dc = SoftDiceLossSquared(apply_nonlin=softmax_helper, **soft_dice_kwargs)
+
+    def forward(self, net_output, target):
+        dc_loss = self.dc(net_output, target)
+        ce_loss = self.ce(net_output, target)
+        if self.aggregate == "sum":
+            result = ce_loss + dc_loss
+        else:
+            raise NotImplementedError("nah son") # reserved for other stuff (later?)
         return result

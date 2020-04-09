@@ -1,4 +1,4 @@
-#    Copyright 2019 Division of Medical Image Computing, German Cancer Research Center (DKFZ), Heidelberg, Germany
+#    Copyright 2020 Division of Medical Image Computing, German Cancer Research Center (DKFZ), Heidelberg, Germany
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ import shutil
 from batchgenerators.utilities.file_and_folder_operations import *
 from multiprocessing import Pool
 from collections import OrderedDict
+from nnunet.utilities.maybe_mkdir_p import maybe_mkdir_p
 
 
 def create_nonzero_mask(data):
@@ -50,11 +51,13 @@ def crop_to_bbox(image, bbox):
 
 def get_case_identifier(case):
     case_identifier = case[0].split("/")[-1].split(".nii.gz")[0][:-5]
+    case_identifier = os.path.basename(case_identifier) # zhuc
     return case_identifier
 
 
 def get_case_identifier_from_npz(case):
     case_identifier = case.split("/")[-1][:-4]
+    case_identifier = os.path.basename(case_identifier) # zhuc
     return case_identifier
 
 
@@ -117,7 +120,8 @@ def crop_to_nonzero(data, seg=None, nonzero_label=-1):
 
 
 def get_patient_identifiers_from_cropped_files(folder):
-    return [i.split("/")[-1][:-4] for i in subfiles(folder, join=True, suffix=".npz")]
+    return [i.split(os.sep)[-1][:-4] for i in subfiles(folder, join=True, suffix=".npz")] # zhuc
+    # return [i.split("/")[-1][:-4] for i in subfiles(folder, join=True, suffix=".npz")]
 
 
 class ImageCropper(object):
@@ -155,17 +159,22 @@ class ImageCropper(object):
         return ImageCropper.crop(data, properties, seg)
 
     def load_crop_save(self, case, case_identifier, overwrite_existing=False):
-        print(case_identifier)
-        if overwrite_existing \
-                or (not os.path.isfile(os.path.join(self.output_folder, "%s.npz" % case_identifier))
-                    or not os.path.isfile(os.path.join(self.output_folder, "%s.pkl" % case_identifier))):
+        try:
+            print(case_identifier)
+            if overwrite_existing \
+                    or (not os.path.isfile(os.path.join(self.output_folder, "%s.npz" % case_identifier))
+                        or not os.path.isfile(os.path.join(self.output_folder, "%s.pkl" % case_identifier))):
 
-            data, seg, properties = self.crop_from_list_of_files(case[:-1], case[-1])
+                data, seg, properties = self.crop_from_list_of_files(case[:-1], case[-1])
 
-            all_data = np.vstack((data, seg))
-            np.savez_compressed(os.path.join(self.output_folder, "%s.npz" % case_identifier), data=all_data)
-            with open(os.path.join(self.output_folder, "%s.pkl" % case_identifier), 'wb') as f:
-                pickle.dump(properties, f)
+                all_data = np.vstack((data, seg))
+                np.savez_compressed(os.path.join(self.output_folder, "%s.npz" % case_identifier), data=all_data)
+                with open(os.path.join(self.output_folder, "%s.pkl" % case_identifier), 'wb') as f:
+                    pickle.dump(properties, f)
+        except Exception as e:
+            print("Exception in", case_identifier, ":")
+            print(e)
+            raise e
 
     def _load_crop_save_star(self, args):
         return self.load_crop_save(*args)
